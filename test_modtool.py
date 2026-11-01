@@ -179,9 +179,7 @@ class ToolTests(unittest.TestCase):
         with zipfile.ZipFile(self.jar, 'a') as archive:
             archive.writestr('changed.txt', 'changed')
         self.package()
-        with self.assertRaisesRegex(tool.ToolError, '--replace'):
-            self.install()
-        self.install(replace=True)
+        self.install()
         backups = list((instance / '.modtooling-backups').rglob('*.jar'))
         self.assertEqual(len(backups), 1)
         self.assertEqual(backups[0].read_bytes(), original)

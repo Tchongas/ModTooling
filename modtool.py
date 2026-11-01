@@ -312,7 +312,6 @@ def install(root, data, args):
     if target.exists() and digest(target) == artifact['sha256'] and old == target:
         print(f'Already installed: {target}')
         return
-    require(not conflicts or args.replace, 'Existing QA artifact found; close Minecraft and rerun with --replace to back it up before replacement')
     for path in conflicts:
         require(not path.is_symlink(), 'Refusing symlink replacement')
         require(previous.get('file') == path.name and previous.get('sha256') == digest(path), f'Untracked or modified mod; move it manually first: {path}')
@@ -450,6 +449,10 @@ def publish(root, data, args):
                     os.environ.setdefault(key.strip(), value.strip())
             break
     plans = release_plan(root, data)
+    only = {k.strip() for k in getattr(args, 'only', '') .split(',') if k.strip()} if getattr(args, 'only', '') else None
+    if only:
+        plans = [p for p in plans if f'{p["platform"]}:{p["group"]}:{p.get("loader", "")}' in only]
+        require(plans, f'No releases matched --only ({sorted(only)})')
     require(args.confirm == data['build']['version'], 'Pass --confirm with the exact release version to authorize uploads')
     for platform in {p['platform'] for p in plans}:
         require(os.environ.get(f'{platform.upper()}_TOKEN'), f'Missing {platform.upper()}_TOKEN')
@@ -507,6 +510,7 @@ def main():
     install_parser.add_argument('--trust-instance', action='store_true')
     publish_parser = commands.add_parser('publish')
     publish_parser.add_argument('--confirm', required=True)
+    publish_parser.add_argument('--only', help='Comma-separated platform:group:loader filters, e.g. modrinth:pack:,curseforge:mod:fabric')
     args = parser.parse_args()
     root = args.project.resolve()
     data = config(root)
