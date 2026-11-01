@@ -293,49 +293,58 @@ def install(root, data, args):
         require(args.trust_instance, 'Cannot inspect launcher metadata. Check loader/version and pass --trust-instance explicitly.')
     mods = instance / 'mods'
     require(mods.is_dir() and not mods.is_symlink(), 'Expected an existing, non-symlink mods directory')
-    artifact = next(a for a in manifest['artifacts'] if a['kind'] == loader)
-    target = mods / artifact['file']
-    require(not target.is_symlink(), 'Refusing symlink mod destination')
+    artifacts = [a for a in manifest['artifacts'] if a['kind'] in data['loaders']]
     state_path = root / '.devin/qa-state.local.json'
     state = read_json(state_path) if state_path.is_file() else {}
-    previous = state.get(str(instance), {})
-    old = mods / previous.get('file', artifact['file'])
-    require(old.parent == mods, 'Invalid previous QA filename')
-    for candidate in mods.glob('*.jar'):
-        if candidate in (target, old) or not zipfile.is_zipfile(candidate):
+    prev_raw = state.get(str(instance), {})
+    previous = prev_raw.get('files') or ({loader: prev_raw} if 'file' in prev_raw else {})
+    installed = {}
+    for artifact in artifacts:
+        target = mods / artifact['file']
+        require(not target.is_symlink(), 'Refusing symlink mod destination')
+        prev = previous.get(artifact['kind'], {})
+        old_name = prev.get('file', artifact['file'])
+        require(Path(old_name).name == old_name, 'Invalid previous QA filename')
+        old = mods / old_name
+        if artifact['kind'] == 'fabric':
+            for candidate in mods.glob('*.jar'):
+                if candidate in (target, old) or not zipfile.is_zipfile(candidate):
+                    continue
+                with zipfile.ZipFile(candidate) as archive:
+                    if 'fabric.mod.json' in archive.namelist():
+                        metadata = json.loads(archive.read('fabric.mod.json'))
+                        require(metadata.get('id') != data['build']['mod_id'], f'Another version of this mod is already installed; move it manually first: {candidate}')
+        conflicts = [p for p in {target, old} if p.exists()]
+        if target.exists() and digest(target) == artifact['sha256'] and old == target:
+            print(f'Already installed: {target}')
+            installed[artifact['kind']] = {'file': artifact['file'], 'sha256': artifact['sha256']}
             continue
-        with zipfile.ZipFile(candidate) as archive:
-            if loader == 'fabric' and 'fabric.mod.json' in archive.namelist():
-                metadata = json.loads(archive.read('fabric.mod.json'))
-                require(metadata.get('id') != data['build']['mod_id'], f'Another version of this mod is already installed; move it manually first: {candidate}')
-    conflicts = [p for p in {target, old} if p.exists()]
-    if target.exists() and digest(target) == artifact['sha256'] and old == target:
-        print(f'Already installed: {target}')
-        return
-    for path in conflicts:
-        require(not path.is_symlink(), 'Refusing symlink replacement')
-        require(previous.get('file') == path.name and previous.get('sha256') == digest(path), f'Untracked or modified mod; move it manually first: {path}')
-    source = output_dir(root, data) / artifact['file']
-    backup = instance / '.modtooling-backups' / uuid.uuid4().hex
-    with tempfile.NamedTemporaryFile(dir=mods, suffix='.pending', delete=False) as stream:
-        temporary = Path(stream.name)
-        stream.write(source.read_bytes())
-    moved = []
-    try:
         for path in conflicts:
-            backup.mkdir(parents=True, exist_ok=True)
-            saved = backup / path.name
-            path.rename(saved)
-            moved.append((saved, path))
-        temporary.replace(target)
-    except OSError:
-        for saved, original in reversed(moved):
-            saved.rename(original)
-        temporary.unlink(missing_ok=True)
-        raise
-    state[str(instance)] = {'file': artifact['file'], 'sha256': artifact['sha256']}
+            require(not path.is_symlink(), 'Refusing symlink replacement')
+            require(prev.get('file') == path.name and prev.get('sha256') == digest(path), f'Untracked or modified mod; move it manually first: {path}')
+        source = output_dir(root, data) / artifact['file']
+        backup = instance / '.modtooling-backups' / uuid.uuid4().hex
+        with tempfile.NamedTemporaryFile(dir=mods, suffix='.pending', delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(source.read_bytes())
+        moved = []
+        try:
+            for path in conflicts:
+                backup.mkdir(parents=True, exist_ok=True)
+                saved = backup / path.name
+                path.rename(saved)
+                moved.append((saved, path))
+            temporary.replace(target)
+        except OSError:
+            for saved, original in reversed(moved):
+                saved.rename(original)
+            temporary.unlink(missing_ok=True)
+            raise
+        installed[artifact['kind']] = {'file': artifact['file'], 'sha256': artifact['sha256']}
+        print(f'Installed ({artifact["kind"]}): {target}' + ('  [not this instance\'s loader — enable in launcher when testing it]' if artifact['kind'] != loader else ''))
+    state[str(instance)] = {'files': installed}
     write_json(state_path, state)
-    print(f'Installed: {target}\nLaunch Minecraft manually; installation is not a gameplay QA pass.')
+    print('Launch Minecraft manually; installation is not a gameplay QA pass.')
 
 
 def multipart(field, metadata, files):
