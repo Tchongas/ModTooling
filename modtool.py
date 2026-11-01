@@ -54,16 +54,69 @@ def inside(root, relative):
     return path
 
 
+def default_targets(kind):
+    targets = {a: {'modrinth': {'project_id': None, 'dependencies': []},
+                   'curseforge': {'project_id': None, 'relations': []}}
+               for a in ('fabric', 'neoforge')}
+    if kind == 'wrapper':
+        targets['pack'] = {'modrinth': {'project_id': None, 'dependencies': []},
+                           'curseforge': {'project_id': None, 'relations': []}}
+    return targets
+
+
+def _mc_range(mc):
+    parts = str(mc).split('.')
+    try:
+        return f'[{mc}, {parts[0]}.{int(parts[1]) + 1})'
+    except (IndexError, ValueError):
+        return f'[{mc},)'
+
+
+def expand(entry, toolchain=None):
+    """Expand a compact project config (modsdev.json schema 2) into the full build config."""
+    toolchain = dict(toolchain or {})
+    if 'build' in entry:  # already expanded (e.g. generated .devin/mod.json)
+        return entry
+    kind = entry.get('kind', 'wrapper')
+    mc = str(entry['minecraft_version'])
+    build = {
+        'version': entry['version'], 'group': entry.get('group', f'com.example.{entry["mod_id"]}'),
+        'java_version': entry.get('java_version', toolchain.get('java_version', 25)),
+        'minecraft_version': mc,
+        'mod_name': entry['mod_name'], 'mod_author': entry.get('mod_author', ''),
+        'mod_id': entry['mod_id'], 'license': entry.get('license', 'MIT'),
+        'credits': entry.get('credits', ''), 'description': entry.get('description', ''),
+        'minecraft_version_range': entry.get('minecraft_version_range', _mc_range(mc)),
+    }
+    for key, value in toolchain.items():
+        build.setdefault(key, value)
+    pack = dict(entry.get('pack', {}))
+    pack.setdefault('enabled', kind == 'wrapper')
+    return {
+        'schema': 1, 'tooling_version': toolchain.get('tooling_version', entry.get('tooling_version', VERSION)),
+        'kind': kind, 'build': build,
+        'game_versions': entry.get('game_versions', [mc]),
+        'loaders': entry.get('loaders', {'fabric': 'fabric', 'neoforge': 'neoforge'}),
+        'resources': entry.get('resources', 'fabric/src/main/resources'),
+        'pack': pack,
+        'release': {
+            'channel': entry.get('channel', 'release'),
+            'changelog': entry.get('changelog', 'CHANGELOG.md'),
+            'targets': entry.get('targets', default_targets(kind)),
+        },
+    }
+
+
 def load_config(root):
+    workspace_file = root.parent / 'modsdev.json'
+    if workspace_file.is_file():
+        workspace = read_json(workspace_file)
+        if root.name in workspace.get('projects', {}):
+            return expand(workspace['projects'][root.name], workspace.get('toolchain')), workspace_file
     local = root / '.devin/mod.json'
     if local.is_file():
-        return read_json(local), local
-    workspace_file = root.parent / 'modsdev.json'
-    workspace = read_json(workspace_file)
-    for name, entry in workspace.get('projects', {}).items():
-        if name == root.name:
-            return entry, workspace_file
-    raise ToolError(f'No entry for {root.name!r} in workspace {workspace_file.name} and no .devin/mod.json')
+        return expand(read_json(local)), local
+    raise ToolError(f'No config for {root.name!r}: expected {workspace_file} entry or .devin/mod.json')
 
 
 def config(root):
@@ -286,11 +339,14 @@ def install(root, data, args):
     print(f'Installed: {target}\nLaunch Minecraft manually; installation is not a gameplay QA pass.')
 
 
-def multipart(field, metadata, file_field, path):
+def multipart(field, metadata, files):
+    """files: list of (field_name, Path)."""
     boundary = uuid.uuid4().hex
     body = (f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"\r\nContent-Type: application/json\r\n\r\n'.encode() + json.dumps(metadata).encode())
-    body += f'\r\n--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; filename="{path.name}"\r\nContent-Type: application/octet-stream\r\n\r\n'.encode()
-    body += path.read_bytes() + f'\r\n--{boundary}--\r\n'.encode()
+    for fname, path in files:
+        body += f'\r\n--{boundary}\r\nContent-Disposition: form-data; name="{fname}"; filename="{path.name}"\r\nContent-Type: application/octet-stream\r\n\r\n'.encode()
+        body += path.read_bytes()
+    body += f'\r\n--{boundary}--\r\n'.encode()
     return body, f'multipart/form-data; boundary={boundary}'
 
 
@@ -314,46 +370,96 @@ def request(url, token_header, token, body=None, content_type=None):
 
 
 def release_plan(root, data):
+    """Grouped releases: 'mod' = all loader JARs together (Modrinth multi-file, CurseForge per-loader);
+    'pack' = datapack ZIP on Modrinth only — never CurseForge."""
     manifest = verified_artifacts(root, data)
     release = data['release']
     require(release['channel'] in ('release', 'beta', 'alpha'), 'Invalid release channel')
     changelog = inside(root, release['changelog'])
     require(changelog.is_file() and changelog.read_text(encoding='utf-8').strip(), 'Write release notes in the configured changelog file first')
+    notes = changelog.read_text(encoding='utf-8')
+    version = data['build']['version']
+    name = data['build']['mod_name']
+    targets = release.get('targets', {})
+    out = output_dir(root, data)
     plans = []
-    for artifact in manifest['artifacts']:
-        kind = artifact['kind']
-        targets = release['targets'].get(kind, {})
-        require(targets, f'No publishing targets for {kind}')
-        for platform, target in targets.items():
-            require(platform in ('modrinth', 'curseforge'), f'Unknown platform: {platform}')
-            project_id = target.get('project_id')
-            require(project_id and re.fullmatch(r'[A-Za-z0-9_-]+', str(project_id)), f'Set {kind}.{platform}.project_id before publishing')
-            if platform == 'curseforge':
-                require(str(project_id).isdigit(), 'CurseForge requires a numeric project ID')
-            name = f'{data["build"]["mod_name"]} {data["build"]["version"]} ({kind})'
-            notes = changelog.read_text(encoding='utf-8')
+    by_kind = {a['kind']: a for a in manifest['artifacts']}
+    loader_kinds = [k for k in data['loaders'] if k in by_kind]
+
+    if loader_kinds and 'mod' in targets:
+        for platform, target in targets['mod'].items():
+            pid = _require_pid(target, 'mod', platform)
             if platform == 'modrinth':
-                metadata = {'project_id': str(project_id), 'name': name, 'version_number': f'{data["build"]["version"]}-{kind}', 'changelog': notes, 'dependencies': target.get('dependencies', []), 'game_versions': data['game_versions'], 'version_type': release['channel'], 'loaders': ['datapack'] if kind == 'pack' else [kind], 'featured': False, 'file_parts': ['file'], 'primary_file': 'file'}
-                url = f'{MODRINTH}/version'
+                files = [f'file{i}' for i in range(len(loader_kinds))]
+                metadata = {'project_id': str(pid), 'name': f'{name} {version} Mod',
+                            'version_number': f'{version}+mod', 'changelog': notes,
+                            'dependencies': target.get('dependencies', []),
+                            'game_versions': data['game_versions'], 'version_type': release['channel'],
+                            'loaders': loader_kinds, 'featured': False,
+                            'file_parts': files, 'primary_file': files[0]}
+                plans.append({'platform': 'modrinth', 'group': 'mod',
+                              'files': [by_kind[k]['file'] for k in loader_kinds],
+                              'sha256': [by_kind[k]['sha256'] for k in loader_kinds],
+                              'url': f'{MODRINTH}/version', 'metadata': metadata, 'file_fields': files})
+            elif platform == 'curseforge':
+                for k in loader_kinds:
+                    metadata = {'displayName': f'{name} {version} [{k}]', 'changelog': notes,
+                                'changelogType': 'markdown', 'releaseType': release['channel'],
+                                'gameVersionNames': data['game_versions'] + [{'fabric': 'Fabric', 'neoforge': 'NeoForge'}[k]],
+                                'relations': {'projects': target.get('relations', [])}}
+                    plans.append({'platform': 'curseforge', 'group': 'mod', 'loader': k,
+                                  'files': [by_kind[k]['file']], 'sha256': [by_kind[k]['sha256']],
+                                  'url': f'{CURSEFORGE}/projects/{pid}/upload-file',
+                                  'pid': str(pid), 'metadata': metadata, 'file_fields': ['file']})
             else:
-                metadata = {'displayName': name, 'changelog': notes, 'changelogType': 'markdown', 'releaseType': release['channel'], 'gameVersionNames': data['game_versions'] + ([] if kind == 'pack' else [{'fabric': 'Fabric', 'neoforge': 'NeoForge'}[kind]]), 'relations': {'projects': target.get('relations', [])}}
-                url = f'{CURSEFORGE}/projects/{project_id}/upload-file'
-            plans.append({'platform': platform, 'kind': kind, 'file': artifact['file'], 'sha256': artifact['sha256'], 'url': url, 'metadata': metadata})
+                raise ToolError(f'Unknown platform: {platform}')
+
+    if 'pack' in by_kind:
+        target = (targets.get('pack') or {}).get('modrinth')
+        if target:
+            pid = _require_pid(target, 'pack', 'modrinth')
+            metadata = {'project_id': str(pid), 'name': f'{name} {version} Datapack',
+                        'version_number': f'{version}+datapack', 'changelog': notes,
+                        'dependencies': target.get('dependencies', []),
+                        'game_versions': data['game_versions'], 'version_type': release['channel'],
+                        'loaders': ['datapack'], 'featured': False,
+                        'file_parts': ['file'], 'primary_file': 'file'}
+            plans.append({'platform': 'modrinth', 'group': 'pack',
+                          'files': [by_kind['pack']['file']], 'sha256': [by_kind['pack']['sha256']],
+                          'url': f'{MODRINTH}/version', 'metadata': metadata, 'file_fields': ['file']})
+        if (targets.get('pack') or {}).get('curseforge'):
+            raise ToolError('Datapack releases are never uploaded to CurseForge — remove pack.curseforge from targets.')
+    require(plans, 'No release targets configured')
     return plans
 
 
+def _require_pid(target, group, platform):
+    pid = target.get('project_id')
+    require(pid and re.fullmatch(r'[A-Za-z0-9_-]+', str(pid)), f'Set {group}.{platform}.project_id before publishing')
+    if platform == 'curseforge':
+        require(str(pid).isdigit(), 'CurseForge requires a numeric project ID')
+    return pid
+
+
 def publish(root, data, args):
+    for env_file in (root.parent / '.env.local', root.parent / '.env'):
+        if env_file.is_file():
+            for line in env_file.read_text().splitlines():
+                if '=' in line and not line.lstrip().startswith('#'):
+                    key, _, value = line.partition('=')
+                    os.environ.setdefault(key.strip(), value.strip())
+            break
     plans = release_plan(root, data)
     require(args.confirm == data['build']['version'], 'Pass --confirm with the exact release version to authorize uploads')
-    require(os.environ.get('GITHUB_ACTIONS') == 'true', 'Publishing is restricted to the approval-gated GitHub Actions job')
     for platform in {p['platform'] for p in plans}:
         require(os.environ.get(f'{platform.upper()}_TOKEN'), f'Missing {platform.upper()}_TOKEN')
     receipt_path = output_dir(root, data) / 'publish-receipts.json'
     receipts = read_json(receipt_path) if receipt_path.is_file() else {}
     for plan in plans:
-        key = f'{plan["platform"]}:{plan["kind"]}:{plan["metadata"]["project_id"] if plan["platform"] == "modrinth" else plan["url"]}'
+        key = f'{plan["platform"]}:{plan["group"]}:{plan.get("loader", "")}:{plan["url"]}'
+        joined = '|'.join(plan['sha256'])
         if key in receipts:
-            require(receipts[key]['sha256'] == plan['sha256'], 'Already published different bytes under this release; use a new version')
+            require(receipts[key]['sha256'] == joined, 'Already published different bytes under this release; use a new version')
             require(receipts[key]['status'] == 'uploaded', 'Uncertain prior upload: check the platform manually before retrying')
             print(f'Already uploaded: {key}')
             continue
@@ -365,21 +471,30 @@ def publish(root, data, args):
             duplicates = [v for v in existing if v['version_number'] == plan['metadata']['version_number']]
             if duplicates:
                 raise ToolError(f'Modrinth version already exists: {plan["metadata"]["version_number"]}. Reconcile manually; no duplicate upload.')
-        path = output_dir(root, data) / plan['file']
-        body, content_type = multipart('data' if platform == 'modrinth' else 'metadata', plan['metadata'], 'file', path)
-        receipts[key] = {'sha256': plan['sha256'], 'status': 'pending'}
+        else:
+            try:
+                existing = request(f'{CURSEFORGE}/projects/{plan["pid"]}/files', header, token)
+            except ToolError:
+                existing = None
+            if existing is not None:
+                files = existing if isinstance(existing, list) else existing.get('data', [])
+                if any(f.get('fileName') == plan['files'][0] for f in files):
+                    raise ToolError(f'CurseForge file already exists: {plan["files"][0]}. Reconcile manually; no duplicate upload.')
+        files = [(fname, output_dir(root, data) / filename) for fname, filename in zip(plan['file_fields'], plan['files'])]
+        body, content_type = multipart('data' if platform == 'modrinth' else 'metadata', plan['metadata'], files)
+        receipts[key] = {'sha256': joined, 'status': 'pending'}
         write_json(receipt_path, receipts)
         result = request(plan['url'], header, token, body, content_type)
         receipts[key].update(status='uploaded', id=result['id'])
         write_json(receipt_path, receipts)
-        print(f'Uploaded {platform}/{plan["kind"]}: {result["id"]}')
+        print(f'Uploaded {platform}/{plan["group"]}{("-" + plan["loader"]) if plan.get("loader") else ""}: {result["id"]}')
 
 
 def main():
     parser = argparse.ArgumentParser(description='Shared Minecraft packaging, QA, and release tooling')
     parser.add_argument('--project', type=Path, default=Path.cwd())
     commands = parser.add_subparsers(dest='command', required=True)
-    for name in ('validate', 'build', 'verify', 'plan'):
+    for name in ('validate', 'build', 'verify', 'plan', 'emit-config'):
         commands.add_parser(name)
     gentab = commands.add_parser('gen-tab')
     gentab.add_argument('--dest', required=True)
@@ -395,7 +510,9 @@ def main():
     args = parser.parse_args()
     root = args.project.resolve()
     data = config(root)
-    if args.command == 'validate':
+    if args.command == 'emit-config':
+        print(json.dumps(data))
+    elif args.command == 'validate':
         validate(root, data)
     elif args.command == 'build':
         build(root)

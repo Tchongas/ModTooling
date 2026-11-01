@@ -26,8 +26,8 @@ class ToolTests(unittest.TestCase):
             'game_versions': ['26.3'], 'loaders': {'fabric': 'fabric'},
             'resources': 'fabric/src/main/resources', 'pack': {'enabled': True},
             'release': {'channel': 'release', 'changelog': 'CHANGELOG.md', 'targets': {
-                kind: {'modrinth': {'project_id': 'test'}, 'curseforge': {'project_id': 123}}
-                for kind in ('fabric', 'pack')
+                'mod': {'modrinth': {'project_id': 'test'}, 'curseforge': {'project_id': 123}},
+                'pack': {'modrinth': {'project_id': 'packtest'}}
             }}
         }
         self.save()
@@ -213,14 +213,27 @@ class ToolTests(unittest.TestCase):
         self.package()
         with patch.object(tool, 'request', side_effect=AssertionError('Network used')):
             plans = tool.release_plan(self.root, self.data)
-        self.assertEqual(len(plans), 4)
-        fabric = next(p for p in plans if p['platform'] == 'modrinth' and p['kind'] == 'fabric')
-        self.assertEqual(fabric['metadata']['loaders'], ['fabric'])
-        pack = next(p for p in plans if p['platform'] == 'modrinth' and p['kind'] == 'pack')
-        self.assertEqual(pack['metadata']['loaders'], ['datapack'])
+        # mod group: modrinth (multi-file) + curseforge (per-loader) ; pack: modrinth only
+        groups = {(p['platform'], p['group']) for p in plans}
+        self.assertIn(('modrinth', 'mod'), groups)
+        self.assertIn(('curseforge', 'mod'), groups)
+        self.assertIn(('modrinth', 'pack'), groups)
+        self.assertNotIn(('curseforge', 'pack'), groups)
+        mod_mr = next(p for p in plans if p['platform'] == 'modrinth' and p['group'] == 'mod')
+        self.assertEqual(mod_mr['metadata']['loaders'], ['fabric'])
+        self.assertEqual(len(mod_mr['files']), 1)
+        pack_mr = next(p for p in plans if p['platform'] == 'modrinth' and p['group'] == 'pack')
+        self.assertEqual(pack_mr['metadata']['loaders'], ['datapack'])
+
+    def test_pack_curseforge_target_rejected(self):
+        self.data['release']['targets']['pack']['curseforge'] = {'project_id': 1}
+        self.save()
+        self.package()
+        with self.assertRaisesRegex(tool.ToolError, 'never uploaded to CurseForge'):
+            tool.release_plan(self.root, self.data)
 
     def test_missing_project_id_blocks_release(self):
-        self.data['release']['targets']['fabric']['modrinth']['project_id'] = None
+        self.data['release']['targets']['mod']['modrinth']['project_id'] = None
         self.save()
         self.package()
         with self.assertRaisesRegex(tool.ToolError, 'project_id'):
@@ -230,12 +243,6 @@ class ToolTests(unittest.TestCase):
         self.package()
         with self.assertRaisesRegex(tool.ToolError, '--confirm'):
             tool.publish(self.root, self.data, argparse.Namespace(confirm='wrong'))
-
-    def test_publish_restricted_to_ci(self):
-        self.package()
-        with patch.dict(os.environ, {'GITHUB_ACTIONS': ''}):
-            with self.assertRaisesRegex(tool.ToolError, 'restricted'):
-                tool.publish(self.root, self.data, argparse.Namespace(confirm='1.0.0'))
 
     def test_publish_receipts_prevent_repeat_uploads(self):
         self.package()

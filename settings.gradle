@@ -1,16 +1,18 @@
 import groovy.json.JsonSlurper
 
-def local = new File(settings.settingsDir, '.devin/mod.json')
-def config
-if (local.isFile()) {
-    config = new JsonSlurper().parse(local)
-} else {
-    def root = new JsonSlurper().parse(new File(settings.settingsDir.parentFile, 'modsdev.json'))
-    config = root.projects[settings.rootDir.name]
-    if (config == null) throw new GradleException("No entry for '${settings.rootDir.name}' in workspace modsdev.json")
-}
 def toolingDir = settings.providers.gradleProperty('modToolingDir').orElse(settings.providers.environmentVariable('MOD_TOOLING_HOME')).getOrElse('../ModTooling')
 def tooling = settings.settingsDir.toPath().resolve(toolingDir).toFile()
+def python = settings.providers.environmentVariable('MOD_TOOLING_PYTHON').getOrElse('python')
+
+def config
+try {
+    def result = settings.providers.exec {
+        commandLine python, new File(tooling, 'modtool.py').absolutePath, '--project', settings.settingsDir.absolutePath, 'emit-config'
+    }
+    config = new JsonSlurper().parseText(result.standardOutput.asText.get())
+} catch (Exception e) {
+    throw new GradleException("Failed to load project config via ModTooling (${e.message}). Install Python 3.11+ or set MOD_TOOLING_PYTHON.", e)
+}
 if (!new File(tooling, 'VERSION').isFile() || new File(tooling, 'VERSION').text.trim() != config.tooling_version) {
     throw new GradleException("ModTooling ${config.tooling_version} required. Set MOD_TOOLING_HOME or -PmodToolingDir to its checkout.")
 }
