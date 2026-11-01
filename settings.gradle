@@ -1,0 +1,25 @@
+import groovy.json.JsonSlurper
+
+def local = new File(settings.settingsDir, '.devin/mod.json')
+def config
+if (local.isFile()) {
+    config = new JsonSlurper().parse(local)
+} else {
+    def root = new JsonSlurper().parse(new File(settings.settingsDir.parentFile, 'modsdev.json'))
+    config = root.projects[settings.rootDir.name]
+    if (config == null) throw new GradleException("No entry for '${settings.rootDir.name}' in workspace modsdev.json")
+}
+def toolingDir = settings.providers.gradleProperty('modToolingDir').orElse(settings.providers.environmentVariable('MOD_TOOLING_HOME')).getOrElse('../ModTooling')
+def tooling = settings.settingsDir.toPath().resolve(toolingDir).toFile()
+if (!new File(tooling, 'VERSION').isFile() || new File(tooling, 'VERSION').text.trim() != config.tooling_version) {
+    throw new GradleException("ModTooling ${config.tooling_version} required. Set MOD_TOOLING_HOME or -PmodToolingDir to its checkout.")
+}
+gradle.beforeProject { p ->
+    config.build.each { key, value -> p.ext.set(key, value) }
+    p.version = config.build.version
+    p.group = config.build.group
+    p.description = config.build.description
+    p.ext.modToolingHome = tooling
+    p.ext.modConfig = config
+}
+config.loaders.each { loader, module -> settings.include(module) }

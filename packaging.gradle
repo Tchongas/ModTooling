@@ -1,0 +1,47 @@
+plugins.apply('base')
+
+def python = providers.environmentVariable('MOD_TOOLING_PYTHON').getOrElse('python')
+def cli = new File(modToolingHome, 'modtool.py').absolutePath
+def validate = tasks.register('validateProject', Exec) {
+    group = 'verification'
+    commandLine python, cli, '--project', projectDir.absolutePath, 'validate'
+}
+def artifacts = tasks.register('packageArtifacts', Exec) {
+    group = 'distribution'
+    dependsOn validate
+    modConfig.loaders.each { loader, module ->
+        dependsOn ":${module}:check", ":${module}:jar"
+    }
+    doFirst {
+        def arguments = [python, cli, '--project', projectDir.absolutePath, 'package']
+        modConfig.loaders.each { loader, module ->
+            arguments.addAll(['--artifact', "${loader}=${project(":${module}").tasks.named('jar').get().archiveFile.get().asFile.absolutePath}"])
+        }
+        if (modConfig.pack.enabled) {
+            def module = modConfig.loaders.values().first()
+            arguments.addAll(['--resources', project(":${module}").tasks.named('processResources').get().destinationDir.absolutePath])
+        }
+        commandLine arguments
+    }
+}
+tasks.named('check') { dependsOn validate }
+tasks.named('build') { dependsOn artifacts }
+if (modConfig.pack.enabled) {
+    modConfig.loaders.each { loader, module ->
+        def genTab = tasks.register("generateCreativeTab-${module}", Exec) {
+            def res = project(":${module}").tasks.named('processResources')
+            dependsOn res
+            commandLine python, cli, '--project', projectDir.absolutePath, 'gen-tab', '--dest', res.get().destinationDir.absolutePath
+        }
+        tasks.named('packageArtifacts') { dependsOn genTab }
+    }
+}
+gradle.projectsEvaluated {
+    modConfig.loaders.each { loader, module ->
+        project(":${module}").tasks.named('build') { dependsOn artifacts }
+        if (modConfig.pack.enabled) {
+            def genTab = tasks.named("generateCreativeTab-${module}")
+            project(":${module}").tasks.named('jar') { dependsOn genTab }
+        }
+    }
+}
