@@ -300,28 +300,33 @@ def install(root, data, args):
     previous = prev_raw.get('files') or ({loader: prev_raw} if 'file' in prev_raw else {})
     installed = {}
     for artifact in artifacts:
-        target = mods / artifact['file']
-        require(not target.is_symlink(), 'Refusing symlink mod destination')
         prev = previous.get(artifact['kind'], {})
         old_name = prev.get('file', artifact['file'])
         require(Path(old_name).name == old_name, 'Invalid previous QA filename')
-        old = mods / old_name
+        # Preserve launcher-disabled state: if the old jar is present as *.disabled, install the new one disabled too.
+        candidates = {artifact['file'], old_name}
+        disabled = any((mods / (n + '.disabled')).exists() for n in candidates)
+        suffix = '.disabled' if disabled else ''
+        target = mods / (artifact['file'] + suffix)
+        require(not target.is_symlink(), 'Refusing symlink mod destination')
+        tracked_names = {n + s for n in candidates for s in ('', '.disabled')}
+        conflicts = [mods / n for n in tracked_names if (mods / n).exists()]
         if artifact['kind'] == 'fabric':
             for candidate in mods.glob('*.jar'):
-                if candidate in (target, old) or not zipfile.is_zipfile(candidate):
+                if candidate in conflicts or not zipfile.is_zipfile(candidate):
                     continue
                 with zipfile.ZipFile(candidate) as archive:
                     if 'fabric.mod.json' in archive.namelist():
                         metadata = json.loads(archive.read('fabric.mod.json'))
                         require(metadata.get('id') != data['build']['mod_id'], f'Another version of this mod is already installed; move it manually first: {candidate}')
-        conflicts = [p for p in {target, old} if p.exists()]
-        if target.exists() and digest(target) == artifact['sha256'] and old == target:
+        if target.exists() and digest(target) == artifact['sha256'] and len(conflicts) == 1:
             print(f'Already installed: {target}')
             installed[artifact['kind']] = {'file': artifact['file'], 'sha256': artifact['sha256']}
             continue
         for path in conflicts:
             require(not path.is_symlink(), 'Refusing symlink replacement')
-            require(prev.get('file') == path.name and prev.get('sha256') == digest(path), f'Untracked or modified mod; move it manually first: {path}')
+            base = path.name[:-len('.disabled')] if path.name.endswith('.disabled') else path.name
+            require(base in {artifact['file'], prev.get('file')} and prev.get('sha256') == digest(path), f'Untracked or modified mod; move it manually first: {path}')
         source = output_dir(root, data) / artifact['file']
         backup = instance / '.modtooling-backups' / uuid.uuid4().hex
         with tempfile.NamedTemporaryFile(dir=mods, suffix='.pending', delete=False) as stream:
@@ -396,19 +401,24 @@ def release_plan(root, data):
 
     if loader_kinds and 'mod' in targets:
         for platform, target in targets['mod'].items():
+            if not target.get('enabled', True):
+                continue
             pid = _require_pid(target, 'mod', platform)
             if platform == 'modrinth':
-                files = [f'file{i}' for i in range(len(loader_kinds))]
-                metadata = {'project_id': str(pid), 'name': f'{name} {version} Mod',
-                            'version_number': f'{version}+mod', 'changelog': notes,
-                            'dependencies': target.get('dependencies', []),
-                            'game_versions': data['game_versions'], 'version_type': release['channel'],
-                            'loaders': loader_kinds, 'featured': False,
-                            'file_parts': files, 'primary_file': files[0]}
-                plans.append({'platform': 'modrinth', 'group': 'mod',
-                              'files': [by_kind[k]['file'] for k in loader_kinds],
-                              'sha256': [by_kind[k]['sha256'] for k in loader_kinds],
-                              'url': f'{MODRINTH}/version', 'metadata': metadata, 'file_fields': files})
+                for k in loader_kinds:
+                    dependencies = target.get('dependencies', [])
+                    if k != 'fabric':
+                        dependencies = [d for d in dependencies if d.get('project_id') != 'P7dR8mSH']
+                    metadata = {'project_id': str(pid), 'name': f'{name} {version} [{k}]',
+                                'version_number': f'{version}+{k}', 'changelog': notes,
+                                'dependencies': dependencies,
+                                'game_versions': data['game_versions'], 'version_type': release['channel'],
+                                'loaders': [k], 'featured': False,
+                                'file_parts': ['file'], 'primary_file': 'file'}
+                    plans.append({'platform': 'modrinth', 'group': 'mod', 'loader': k,
+                                  'files': [by_kind[k]['file']],
+                                  'sha256': [by_kind[k]['sha256']],
+                                  'url': f'{MODRINTH}/version', 'metadata': metadata, 'file_fields': ['file']})
             elif platform == 'curseforge':
                 for k in loader_kinds:
                     metadata = {'displayName': f'{name} {version} [{k}]', 'changelog': notes,

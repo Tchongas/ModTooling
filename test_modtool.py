@@ -223,6 +223,16 @@ class ToolTests(unittest.TestCase):
         pack_mr = next(p for p in plans if p['platform'] == 'modrinth' and p['group'] == 'pack')
         self.assertEqual(pack_mr['metadata']['loaders'], ['datapack'])
 
+    def test_disabled_curseforge_skipped(self):
+        self.data['release']['targets']['mod']['curseforge']['enabled'] = False
+        self.package()
+        plans = tool.release_plan(self.root, self.data)
+        self.assertTrue(all(p['platform'] == 'modrinth' for p in plans))
+        mod = next(p for p in plans if p['group'] == 'mod')
+        self.assertEqual(mod['loader'], 'fabric')
+        self.assertEqual(mod['metadata']['version_number'], '1.0.0+fabric')
+        self.assertEqual(mod['metadata']['file_parts'], ['file'])
+
     def test_pack_curseforge_target_rejected(self):
         self.data['release']['targets']['pack']['curseforge'] = {'project_id': 1}
         self.save()
